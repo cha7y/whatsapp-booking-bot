@@ -44,6 +44,12 @@ def process_message(phone_number, message):
     data = session['data']
     msg = message.lower().strip()
     
+    # Debug logging
+    print(f"📱 Phone: {phone_number}")
+    print(f"📝 Message: '{message}' -> '{msg}'")
+    print(f"🔄 Step: {step}")
+    print(f"📊 Data: {data}")
+    
     # KORAK 1: Početak
     if step == 'initial':
         if 'rezerv' in msg or 'termin' in msg:
@@ -120,7 +126,7 @@ Potvrdite rezervaciju: 'DA' ili 'NE'"""
     
     # KORAK 7: Potvrda
     elif step == 'confirm':
-        if msg in ['da', 'yes', 'potvrdi']:
+        if msg in ['da', 'yes', 'potvrdi', 'potvrđujem']:
             # Spremi u bazu
             reservation = {
                 'business': BUSINESS_CONFIG['name'],
@@ -133,7 +139,13 @@ Potvrdite rezervaciju: 'DA' ili 'NE'"""
                 'status': 'confirmed',
                 'created_at': datetime.utcnow()
             }
-            reservations.insert_one(reservation)
+            
+            try:
+                result = reservations.insert_one(reservation)
+                print(f"✅ Reservation saved with ID: {result.inserted_id}")
+            except Exception as e:
+                print(f"❌ Error saving reservation: {e}")
+                return "Greška pri spremanju rezervacije. Molim pokušajte ponovno."
             
             # Reset session
             session['step'] = 'initial'
@@ -141,7 +153,7 @@ Potvrdite rezervaciju: 'DA' ili 'NE'"""
             
             return "🎉 REZERVACIJA POTVRĐENA!\n\nDobit ćete SMS potvrdu.\nHvala što koristite naše usluge!\n\nZa novu rezervaciju napišite 'rezervacija'."
         
-        elif msg in ['ne', 'no', 'odustani']:
+        elif msg in ['ne', 'no', 'odustani', 'cancel']:
             session['step'] = 'initial'
             session['data'] = {}
             return "❌ Rezervacija otkazana.\n\nZa novu rezervaciju napišite 'rezervacija'."
