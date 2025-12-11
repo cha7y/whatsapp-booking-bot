@@ -1,8 +1,9 @@
-# app.py - Glavni Flask server
-from flask import Flask, request
+# app.py - SA PAMETNOM DOSTUPNOŠĆU TERMINA
+
+from flask import Flask, request, render_template_string
 from twilio.twiml.messaging_response import MessagingResponse
 from pymongo import MongoClient
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
 from dotenv import load_dotenv
 
@@ -10,98 +11,178 @@ load_dotenv()
 
 app = Flask(__name__)
 
-# MongoDB konekcija
 MONGODB_URI = os.getenv('MONGODB_URI')
 client = MongoClient(MONGODB_URI)
 db = client['booking_system']
 reservations = db['reservations']
-clients = db['clients']
+clients_db = db['clients']
 
-# Bot state storage (u memoriji - za produkciju koristi Redis)
 user_sessions = {}
 
-# Konfiguracija biznisa (primjer - kasnije iz DB)
-BUSINESS_CONFIG = {
-    'name': 'Frizerski Salon Elegance',
-    'services': ['Šišanje', 'Farbanje', 'Feniranje', 'Manikura'],
-    'working_hours': '09:00-20:00',
-    'available_slots': ['09:00', '10:00', '11:00', '14:00', '15:00', '16:00', '17:00']
-}
+def get_business_config(business_id):
+    """Dohvati konfiguraciju biznisa"""
+    return clients_db.find_one({'business_id': business_id})
+
+def get_all_businesses():
+    """Dohvati sve aktivne biznise"""
+    return list(clients_db.find({'active': True}))
+
+def get_available_slots(business_id, date_str):
+    """
+    PAMETNA PROVJERA DOSTUPNOSTI
+    Vraća samo slobodne termine za određeni datum
+    """
+    business = get_business_config(business_id)
+    if not business:
+        return []
+    
+    all_slots = business['available_slots']
+    
+    # Dohvati sve rezervacije za ovaj biznis i datum
+    existing_reservations = list(reservations.find({
+        'business_id': business_id,
+        'date': date_str,
+        'status': {'$in': ['confirmed', 'pending']}  # Samo aktivne rezervacije
+    }))
+    
+    # Zauzeti termini
+    booked_times = [res['time'] for res in existing_reservations]
+    
+    # Slobodni termini
+    available = [slot for slot in all_slots if slot not in booked_times]
+    
+    return available
 
 def get_user_session(phone_number):
-    """Dohvati ili kreiraj session za korisnika"""
+    """Dohvati ili kreiraj session"""
     if phone_number not in user_sessions:
         user_sessions[phone_number] = {
-            'step': 'initial',
-            'data': {}
+            'step': 'select_business',
+            'data': {},
+            'business_id': None
         }
     return user_sessions[phone_number]
 
 def process_message(phone_number, message):
-    """Glavna logika za obradu poruka"""
+    """Glavna logika sa dinamičkim terminima"""
     session = get_user_session(phone_number)
     step = session['step']
     data = session['data']
     msg = message.lower().strip()
     
-    # Debug logging
-    print(f"📱 Phone: {phone_number}")
-    print(f"📝 Message: '{message}' -> '{msg}'")
-    print(f"🔄 Step: {step}")
-    print(f"📊 Data: {data}")
+    print(f"📱 {phone_number} | Step: {step} | Msg: {msg}")
+    
+    # KORAK 0: Odabir biznisa
+    if step == 'select_business':
+        businesses = get_all_businesses()
+        
+        if not businesses:
+            return "Trenutno nema dostupnih biznisa."
+        
+        if 'rezerv' in msg or 'termin' in msg or msg == 'start':
+            business_list = '\n'.join([
+                f"{i+1}. {b['name']} - {b['city']}" 
+                for i, b in enumerate(businesses)
+            ])
+            return f"👋 Za koji biznis želite rezervirati?\n\n{business_list}\n\nOdaberite broj:"
+        
+        try:
+            business_num = int(msg)
+            if 1 <= business_num <= len(businesses):
+                selected = businesses[business_num - 1]
+                session['business_id'] = selected['business_id']
+                session['step'] = 'initial'
+                data['business_name'] = selected['name']
+                return f"✅ {selected['name']}\n\nZa rezervaciju napišite 'termin'."
+        except ValueError:
+            pass
+        
+        business_list = '\n'.join([
+            f"{i+1}. {b['name']}" for i, b in enumerate(businesses)
+        ])
+        return f"Odaberite biznis:\n\n{business_list}"
+    
+    business_config = get_business_config(session['business_id'])
+    if not business_config:
+        session['step'] = 'select_business'
+        return "Greška. Odaberite biznis ponovno."
     
     # KORAK 1: Početak
     if step == 'initial':
         if 'rezerv' in msg or 'termin' in msg:
             session['step'] = 'service'
-            services_list = '\n'.join([f"{i+1}. {s}" for i, s in enumerate(BUSINESS_CONFIG['services'])])
-            return f"Odlično! Nudimo sljedeće usluge:\n\n{services_list}\n\nOdaberite broj usluge (1-4):"
-        elif 'radno' in msg or 'vrijeme' in msg:
-            return f"Naše radno vrijeme je {BUSINESS_CONFIG['working_hours']}, radnim danima i subotom."
+            services_list = '\n'.join([
+                f"{i+1}. {s}" 
+                for i, s in enumerate(business_config['services'])
+            ])
+            return f"🏪 {business_config['name']}\n\nUsluge:\n\n{services_list}\n\nOdaberite broj:"
+        elif 'radno' in msg:
+            return f"Radno vrijeme: {business_config['working_hours']}"
         else:
-            return 'Pozdrav! 👋\n\nZa rezervaciju napišite "rezervacija" ili "termin".\nZa radno vrijeme napišite "radno vrijeme".'
+            return f"Za rezervaciju u {business_config['name']} napišite 'termin'."
     
-    # KORAK 2: Odabir usluge
+    # KORAK 2: Usluga
     elif step == 'service':
         try:
             service_num = int(msg)
-            if 1 <= service_num <= len(BUSINESS_CONFIG['services']):
-                selected_service = BUSINESS_CONFIG['services'][service_num - 1]
-                data['service'] = selected_service
+            if 1 <= service_num <= len(business_config['services']):
+                data['service'] = business_config['services'][service_num - 1]
                 session['step'] = 'date'
-                return f"✅ Odabrali ste: {selected_service}\n\nZa koji datum želite rezervirati?\n(npr. 15.12.2024 ili 'sutra')"
+                return f"✅ Usluga: {data['service']}\n\nZa koji datum?\n(npr. 15.12.2024 ili 'sutra')"
         except ValueError:
             pass
-        return "Molim odaberite broj usluge (1-4)."
+        return "Molim odaberite broj usluge."
     
     # KORAK 3: Datum
     elif step == 'date':
-        if msg == 'sutra' or msg == 'danas' or '.' in message:
-            data['date'] = message
-            session['step'] = 'time'
-            slots_list = '\n'.join([f"{i+1}. {s}" for i, s in enumerate(BUSINESS_CONFIG['available_slots'])])
-            return f"✅ Datum: {message}\n\nDostupni termini:\n\n{slots_list}\n\nOdaberite broj (1-7):"
-        return "Molim unesite datum (npr. 15.12.2024 ili 'sutra')."
+        # Parse datum
+        if msg == 'danas':
+            date_str = datetime.now().strftime('%d.%m.%Y')
+        elif msg == 'sutra':
+            date_str = (datetime.now() + timedelta(days=1)).strftime('%d.%m.%Y')
+        elif '.' in message:
+            date_str = message
+        else:
+            return "Molim unesite datum (npr. 15.12.2024 ili 'sutra')."
+        
+        data['date'] = date_str
+        session['step'] = 'time'
+        
+        # DINAMIČKA PROVJERA DOSTUPNOSTI! 🎯
+        available_slots = get_available_slots(session['business_id'], date_str)
+        
+        if not available_slots:
+            return f"❌ Nažalost, za {date_str} nema slobodnih termina.\n\nPokušajte s drugim datumom."
+        
+        slots_list = '\n'.join([
+            f"{i+1}. {s}" for i, s in enumerate(available_slots)
+        ])
+        
+        # Spremi dostupne slotove u session
+        data['available_slots'] = available_slots
+        
+        return f"✅ Datum: {date_str}\n\n⏰ Slobodni termini:\n\n{slots_list}\n\nOdaberite broj:"
     
     # KORAK 4: Vrijeme
     elif step == 'time':
         try:
             time_num = int(msg)
-            if 1 <= time_num <= len(BUSINESS_CONFIG['available_slots']):
-                selected_time = BUSINESS_CONFIG['available_slots'][time_num - 1]
-                data['time'] = selected_time
+            available_slots = data.get('available_slots', [])
+            
+            if 1 <= time_num <= len(available_slots):
+                data['time'] = available_slots[time_num - 1]
                 session['step'] = 'name'
-                return f"✅ Vrijeme: {selected_time}\n\nKako se zovete?"
+                return f"✅ Vrijeme: {data['time']}\n\nKako se zovete?"
         except ValueError:
             pass
-        return "Molim odaberite broj termina (1-7)."
+        return "Molim odaberite broj termina."
     
     # KORAK 5: Ime
     elif step == 'name':
         if len(message.strip()) >= 2:
             data['name'] = message.strip()
             session['step'] = 'phone'
-            return f"✅ Ime: {message}\n\nMolim unesite vaš broj telefona:"
+            return f"✅ Ime: {message}\n\nVaš broj telefona:"
         return "Molim unesite vaše ime."
     
     # KORAK 6: Telefon
@@ -113,83 +194,262 @@ def process_message(phone_number, message):
             
             summary = f"""✅ PREGLED REZERVACIJE:
 
-🏪 {BUSINESS_CONFIG['name']}
-💇 Usluga: {data['service']}
-📅 Datum: {data['date']}
-🕐 Vrijeme: {data['time']}
-👤 Ime: {data['name']}
-📞 Telefon: {data['phone']}
+🏪 {business_config['name']}
+📍 {business_config['address']}
+💇 {data['service']}
+📅 {data['date']}
+🕐 {data['time']}
+👤 {data['name']}
+📞 {data['phone']}
 
-Potvrdite rezervaciju: 'DA' ili 'NE'"""
+Potvrdite: 'DA' ili 'NE'"""
             return summary
-        return "Molim unesite ispravan broj telefona."
+        return "Molim unesite ispravan broj."
     
     # KORAK 7: Potvrda
     elif step == 'confirm':
         if msg in ['da', 'yes', 'potvrdi', 'potvrđujem']:
-            # Spremi u bazu
-            reservation = {
-                'business': BUSINESS_CONFIG['name'],
-                'service': data['service'],
-                'date': data['date'],
-                'time': data['time'],
-                'client_name': data['name'],
-                'client_phone': data['phone'],
-                'whatsapp_number': phone_number,
-                'status': 'confirmed',
-                'created_at': datetime.utcnow()
-            }
-            
             try:
+                # DVOSTRUKA PROVJERA - prije spremanja provjeravamo jel termin još slobodan!
+                available_slots = get_available_slots(session['business_id'], data['date'])
+                
+                if data['time'] not in available_slots:
+                    return f"⚠️ Termin {data['time']} je upravo zauzet!\n\nMolim odaberite drugi termin. Napišite 'termin' za ponovni pokušaj."
+                
+                # Spremi rezervaciju
+                reservation = {
+                    'business_id': session['business_id'],
+                    'business_name': business_config['name'],
+                    'business_phone': business_config['phone'],
+                    'business_email': business_config.get('email'),
+                    'service': data['service'],
+                    'date': data['date'],
+                    'time': data['time'],
+                    'client_name': data['name'],
+                    'client_phone': data['phone'],
+                    'whatsapp_number': phone_number,
+                    'status': 'confirmed',
+                    'created_at': datetime.utcnow()
+                }
+                
                 result = reservations.insert_one(reservation)
-                print(f"✅ Reservation saved with ID: {result.inserted_id}")
+                print(f"✅ Reservation saved: {result.inserted_id}")
+                
+                # TODO: Pošalji notifikaciju salonu!
+                
+                # Reset session
+                session['step'] = 'select_business'
+                session['business_id'] = None
+                session['data'] = {}
+                
+                return f"🎉 POTVRĐENO!\n\nRezervirali ste:\n📅 {data['date']} u {data['time']}\n\n{business_config['name']} će vas kontaktirati za potvrdu.\n\nZa novu rezervaciju napišite 'termin'."
+                
             except Exception as e:
-                print(f"❌ Error saving reservation: {e}")
-                return "Greška pri spremanju rezervacije. Molim pokušajte ponovno."
-            
-            # Reset session
-            session['step'] = 'initial'
-            session['data'] = {}
-            
-            return "🎉 REZERVACIJA POTVRĐENA!\n\nDobit ćete SMS potvrdu.\nHvala što koristite naše usluge!\n\nZa novu rezervaciju napišite 'rezervacija'."
+                print(f"❌ Error: {e}")
+                return "Greška pri spremanju. Pokušajte ponovno."
         
-        elif msg in ['ne', 'no', 'odustani', 'cancel']:
-            session['step'] = 'initial'
+        elif msg in ['ne', 'no', 'odustani']:
+            session['step'] = 'select_business'
+            session['business_id'] = None
             session['data'] = {}
-            return "❌ Rezervacija otkazana.\n\nZa novu rezervaciju napišite 'rezervacija'."
+            return "❌ Otkazano."
         
-        return "Molim odgovorite sa 'DA' ili 'NE'."
+        return "Odgovorite sa 'DA' ili 'NE'."
     
-    return "Nisam razumio. Za rezervaciju napišite 'rezervacija'."
+    return "Napišite 'termin' za rezervaciju."
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    """Twilio webhook endpoint"""
+    """Twilio webhook"""
     incoming_msg = request.values.get('Body', '')
     sender = request.values.get('From', '')
     
-    # Obradi poruku
     response_text = process_message(sender, incoming_msg)
     
-    # Twilio odgovor
     resp = MessagingResponse()
     resp.message(response_text)
     
     return str(resp)
 
+@app.route('/salon/<business_id>')
+def salon_dashboard(business_id):
+    """Dashboard za specifičan salon"""
+    business = get_business_config(business_id)
+    
+    if not business:
+        return "Salon nije pronađen", 404
+    
+    # Dohvati sve rezervacije ovog salona
+    salon_reservations = list(reservations.find({
+        'business_id': business_id
+    }).sort('created_at', -1).limit(50))
+    
+    # Grupiraj po datumu
+    reservations_by_date = {}
+    for res in salon_reservations:
+        date = res['date']
+        if date not in reservations_by_date:
+            reservations_by_date[date] = []
+        reservations_by_date[date].append(res)
+    
+    # HTML template za salon dashboard
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>{{ business.name }} - Dashboard</title>
+        <meta charset="UTF-8">
+        <style>
+            body {
+                font-family: Arial, sans-serif;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                padding: 20px;
+                margin: 0;
+            }
+            .container {
+                max-width: 1200px;
+                margin: 0 auto;
+                background: white;
+                border-radius: 15px;
+                padding: 30px;
+                box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+            }
+            h1 { color: #667eea; margin-bottom: 10px; }
+            .info { color: #666; margin-bottom: 30px; }
+            .stats {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                gap: 20px;
+                margin-bottom: 30px;
+            }
+            .stat-card {
+                background: #f8f9fa;
+                padding: 20px;
+                border-radius: 10px;
+                text-align: center;
+            }
+            .stat-card h3 { color: #666; font-size: 14px; margin: 0 0 10px 0; }
+            .stat-card p { color: #333; font-size: 32px; font-weight: bold; margin: 0; }
+            .date-section {
+                margin-bottom: 30px;
+                border: 2px solid #e9ecef;
+                border-radius: 10px;
+                padding: 20px;
+            }
+            .date-header {
+                font-size: 20px;
+                font-weight: bold;
+                color: #667eea;
+                margin-bottom: 15px;
+            }
+            .reservation {
+                background: #f8f9fa;
+                padding: 15px;
+                border-radius: 8px;
+                margin-bottom: 10px;
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+            }
+            .reservation-info strong { display: block; margin-bottom: 5px; }
+            .reservation-time {
+                background: #667eea;
+                color: white;
+                padding: 10px 20px;
+                border-radius: 8px;
+                font-size: 18px;
+                font-weight: bold;
+            }
+            .empty { text-align: center; padding: 40px; color: #999; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>🏪 {{ business.name }}</h1>
+            <div class="info">
+                📍 {{ business.address }}, {{ business.city }}<br>
+                📞 {{ business.phone }}
+                {% if business.email %} | 📧 {{ business.email }}{% endif %}
+            </div>
+            
+            <div class="stats">
+                <div class="stat-card">
+                    <h3>Ukupno rezervacija</h3>
+                    <p>{{ total_reservations }}</p>
+                </div>
+                <div class="stat-card">
+                    <h3>Danas</h3>
+                    <p>{{ today_count }}</p>
+                </div>
+                <div class="stat-card">
+                    <h3>Ovaj tjedan</h3>
+                    <p>{{ week_count }}</p>
+                </div>
+            </div>
+            
+            <h2 style="margin-bottom: 20px;">📅 Rezervacije</h2>
+            
+            {% if reservations_by_date %}
+                {% for date, date_reservations in reservations_by_date.items() %}
+                <div class="date-section">
+                    <div class="date-header">📅 {{ date }}</div>
+                    {% for res in date_reservations %}
+                    <div class="reservation">
+                        <div class="reservation-info">
+                            <strong>{{ res.client_name }}</strong>
+                            <span>{{ res.service }}</span><br>
+                            <small>📞 {{ res.client_phone }}</small>
+                        </div>
+                        <div class="reservation-time">🕐 {{ res.time }}</div>
+                    </div>
+                    {% endfor %}
+                </div>
+                {% endfor %}
+            {% else %}
+                <div class="empty">
+                    <h3>📭 Nema rezervacija</h3>
+                    <p>Rezervacije će se prikazati ovdje</p>
+                </div>
+            {% endif %}
+        </div>
+    </body>
+    </html>
+    """
+    
+    from jinja2 import Template
+    template = Template(html)
+    
+    # Stats
+    total_reservations = len(salon_reservations)
+    today = datetime.now().strftime('%d.%m.%Y')
+    today_count = len([r for r in salon_reservations if r['date'] == today])
+    week_count = len(salon_reservations)  # TODO: Calculate properly
+    
+    return template.render(
+        business=business,
+        reservations_by_date=reservations_by_date,
+        total_reservations=total_reservations,
+        today_count=today_count,
+        week_count=week_count
+    )
+
 @app.route('/health')
 def health():
-    """Health check endpoint"""
-    return {'status': 'ok', 'message': 'WhatsApp Booking Bot is running'}
+    return {'status': 'ok', 'message': 'Smart availability bot running'}
 
 @app.route('/')
 def home():
-    """Home page"""
-    return '''
+    businesses = get_all_businesses()
+    business_links = '<br>'.join([
+        f'<a href="/salon/{b["business_id"]}">{b["name"]} Dashboard</a>' 
+        for b in businesses
+    ])
+    
+    return f'''
     <h1>WhatsApp Booking Bot</h1>
-    <p>Bot je aktivan i radi!</p>
-    <p>Webhook URL: /webhook</p>
-    <p>Health check: /health</p>
+    <p>Bot je aktivan!</p>
+    <h2>Salon Dashboards:</h2>
+    {business_links if business_links else '<p>Nema biznisa u bazi.</p>'}
     '''
 
 if __name__ == '__main__':
