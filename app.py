@@ -1,5 +1,9 @@
 # app.py - SA PAMETNOM DOSTUPNOŠĆU TERMINA
 
+# DEBUGGING - omogući detaljno logiranje
+import logging
+logging.basicConfig(level=logging.DEBUG)
+
 from flask import Flask, request, render_template_string
 from twilio.twiml.messaging_response import MessagingResponse
 from pymongo import MongoClient
@@ -24,8 +28,12 @@ def get_business_config(business_id):
     return clients_db.find_one({'business_id': business_id})
 
 def get_all_businesses():
-    """Dohvati sve aktivne biznise"""
-    return list(clients_db.find({'active': True}))
+    """Dohvati SVE biznise (ignorira active polje)"""
+    all_clients = list(clients_db.find({}))
+    print(f"🔍 Found {len(all_clients)} businesses in database")
+    for client in all_clients:
+        print(f"  - {client.get('name')} (active: {client.get('active')})")
+    return all_clients
 
 def get_available_slots(business_id, date_str):
     """
