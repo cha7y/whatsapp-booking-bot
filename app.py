@@ -17,7 +17,7 @@ app = Flask(__name__)
 
 MONGODB_URI = os.getenv('MONGODB_URI')
 client = MongoClient(MONGODB_URI)
-db = client['booking_system']
+db = client['booking_systems']
 reservations = db['reservations']
 clients_db = db['clients']
 
